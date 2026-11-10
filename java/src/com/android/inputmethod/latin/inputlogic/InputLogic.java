@@ -72,6 +72,11 @@ import javax.annotation.Nonnull;
 public final class InputLogic {
     private static final String TAG = InputLogic.class.getSimpleName();
 
+    // Myanmar visual-order typing: E (U+1031) is typed before its consonant but stored after it.
+    private static final String MYANMAR_E = "\u1031";
+    private static final String ZERO_WIDTH_SPACE = "\u200B";
+    private static final int MYANMAR_VIRAMA = 0x1039;
+
     // TODO : Remove this member when we can.
     final LatinIME mLatinIME;
     private final SuggestionStripViewAccessor mSuggestionStripViewAccessor;
@@ -809,6 +814,11 @@ public final class InputLogic {
     private void handleNonSeparatorEvent(final Event event, final SettingsValues settingsValues,
             final InputTransaction inputTransaction) {
         final int codePoint = event.mCodePoint;
+        // A Myanmar E starts a new syllable: finish the previous one so that only this E is
+        // pending and the syllable before it is never touched again.
+        if (MYANMAR_E.codePointAt(0) == codePoint) {
+            commitTyped(settingsValues, LastComposedWord.NOT_A_SEPARATOR);
+        }
         // TODO: refactor this method to stop flipping isComposingWord around all the time, and
         // make it shorter (possibly cut into several pieces). Also factor
         // handleNonSpecialCharacterEvent which has the same name as other handle* methods but is
@@ -835,6 +845,13 @@ public final class InputLogic {
             resetEntireInputState(mConnection.getExpectedSelectionStart(),
                     mConnection.getExpectedSelectionEnd(), true /* clearSuggestionStrip */);
             isComposingWord = false;
+        }
+        // Myanmar is always composed, whatever the suggestion settings or the text around the
+        // cursor, so that reordering happens in the composer and never on the editor's text.
+        if (!isComposingWord && isMyanmarComposable(codePoint)) {
+            isComposingWord = true;
+            resetComposingState(false /* alsoResetLastComposedWord */);
+            resumeLoneMyanmarE(codePoint);
         }
         // We want to find out whether to start composing a new word with this character. If so,
         // we need to reset the composing state and switch isComposingWord. The order of the
@@ -868,7 +885,15 @@ public final class InputLogic {
             resetComposingState(false /* alsoResetLastComposedWord */);
         }
         if (isComposingWord) {
-            mWordComposer.applyProcessedEvent(event);
+            final String reorderedWord =
+                    insertBeforeTrailingMyanmarE(mWordComposer.getTypedWord(), codePoint);
+            if (null != reorderedWord) {
+                final int[] codePoints = StringUtils.toCodePointArray(reorderedWord);
+                mWordComposer.setComposingWord(codePoints,
+                        mLatinIME.getCoordinatesForCurrentKeyboard(codePoints));
+            } else {
+                mWordComposer.applyProcessedEvent(event);
+            }
             // If it's the first letter, make note of auto-caps state
             if (mWordComposer.isSingleLetter()) {
                 mWordComposer.setCapitalizedModeAtStartComposingTime(inputTransaction.mShiftState);
@@ -1969,11 +1994,69 @@ public final class InputLogic {
      */
     // TODO: Shouldn't this go in some *Utils class instead?
     private CharSequence getTextWithUnderline(final String text) {
+        // A composing word that starts with Myanmar E would be shaped together with the character
+        // before it. A zero-width space, shown but never part of the typed word, keeps it apart.
+        final String displayText = text.startsWith(MYANMAR_E) ? ZERO_WIDTH_SPACE + text : text;
         // TODO: Locale should be determined based on context and the text given.
         return mIsAutoCorrectionIndicatorOn
                 ? SuggestionSpanUtils.getTextWithAutoCorrectionIndicatorUnderline(
-                        mLatinIME, text, getDictionaryFacilitatorLocale())
-                : text;
+                        mLatinIME, displayText, getDictionaryFacilitatorLocale())
+                : displayText;
+    }
+
+
+    private static boolean isMyanmarComposable(final int codePoint) {
+        return codePoint >= 0x1000 && codePoint <= 0x103F;
+    }
+
+    private static boolean isMyanmarConsonant(final int codePoint) {
+        return (codePoint >= 0x1000 && codePoint <= 0x1021) || codePoint == 0x103F;
+    }
+
+    private static boolean isMyanmarMedialOrVirama(final int codePoint) {
+        return (codePoint >= 0x103B && codePoint <= 0x103E) || codePoint == MYANMAR_VIRAMA;
+    }
+
+    /**
+     * Takes back a lone E that was left in the text when its composition was finished before a
+     * consonant arrived (focus change, cursor move). The guard space in front of it is what
+     * identifies it: a finished syllable (consonant followed by E) has no such space, so it is
+     * never touched.
+     * The E becomes the pending composing word again, and the consonant is then put before it.
+     */
+    private void resumeLoneMyanmarE(final int codePoint) {
+        if (!isMyanmarConsonant(codePoint)) return;
+        final CharSequence textBeforeCursor = mConnection.getTextBeforeCursor(2, 0);
+        if (null == textBeforeCursor
+                || !(ZERO_WIDTH_SPACE + MYANMAR_E).contentEquals(textBeforeCursor)) {
+            return;
+        }
+        mConnection.deleteTextBeforeCursor(2);
+        final int[] codePoints = StringUtils.toCodePointArray(MYANMAR_E);
+        mWordComposer.setComposingWord(codePoints,
+                mLatinIME.getCoordinatesForCurrentKeyboard(codePoints));
+    }
+
+    /**
+     * Puts a code point in front of the trailing Myanmar E of a composing syllable.
+     *
+     * A consonant goes before E when E is still alone (typed first) or when it follows a virama
+     * (stacked consonant). A medial or virama goes before E once a consonant precedes it, which
+     * keeps E last: typing E, KA, MEDIAL RA gives KA, MEDIAL RA, E. In any other case the code
+     * point is simply appended.
+     *
+     * @return the new word, or null if the code point has to be appended as usual.
+     */
+    static String insertBeforeTrailingMyanmarE(final String word, final int codePoint) {
+        final int length = word.length();
+        if (length == 0 || !word.endsWith(MYANMAR_E)) return null;
+        final boolean eIsAlone = length == 1;
+        final boolean insert = isMyanmarConsonant(codePoint)
+                ? eIsAlone || word.charAt(length - 2) == MYANMAR_VIRAMA
+                : isMyanmarMedialOrVirama(codePoint) && !eIsAlone;
+        if (!insert) return null;
+        return word.substring(0, length - 1) + StringUtils.newSingleCodePointString(codePoint)
+                + MYANMAR_E;
     }
 
     /**
